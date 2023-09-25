@@ -36,6 +36,7 @@ def pick(options, picker_args=None, fuzzy=True):
     except ValueError:
         index = -1
 
+    key = 0
     if returncode == 0:
         key = 0
     elif returncode == 1:
