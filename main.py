@@ -1,24 +1,62 @@
 #!/usr/bin/env python3
 
-import pyperclip
-import click
-import platform
-import os
-import re
 import logging
+import os
+import platform
+import re
 import subprocess
 import textwrap
 import warnings
-
-from appdirs import user_config_dir
 from pathlib import Path
 from shutil import copy
+import yaml
+
+import click
+import pyperclip
+from appdirs import user_config_dir
 from daemonize import Daemonize
 
-from .picker import pick
 
 logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO"))
 log = logging.getLogger("inkscape-figures")
+
+
+def select(prompt, options, rofi_args=[], fuzzy=True):
+    optionstr = "\n".join(option.replace("\n", " ") for option in options)
+
+    args = ["rofi", "-markup"]
+
+    if fuzzy:
+        args += ["-matching", "fuzzy"]
+
+    args += ["-dmenu", "-p", prompt, "-format", "s", "-i"]
+    args += rofi_args
+    args = [str(arg) for arg in args]
+
+    result = subprocess.run(
+        args, input=optionstr, stdout=subprocess.PIPE, universal_newlines=True
+    )
+
+    returncode = result.returncode
+    stdout = result.stdout.strip()
+
+    selected = stdout.strip()
+
+    try:
+        index = [opt.strip() for opt in options].index(selected)
+    except ValueError:
+        index = -1
+
+    if returncode == 0:
+        code = 0
+    if returncode == 1:
+        code = -1
+    if returncode > 9:
+        code = returncode - 9
+    else:
+        code = -1
+
+    return code, index, selected
 
 
 def inkscape(path):
@@ -36,65 +74,79 @@ def beautify(name):
     return name.replace("_", " ").replace("-", " ").title()
 
 
-def latex_template(name, title):
-    label = title.replace("-", "_").replace(" ", "_").lower()
-    title = title.replace("-", " ").replace("_", " ").title()
+def latexTemplate(name, caption):
+    label = caption.replace("-", "_").replace(" ", "_").lower()
+    caption = caption.replace("-", " ").replace("_", " ").title()
 
     return "\n".join(
         (
-            r"\begin{figure}[ht]",
+            r"\begin{figure}[H]",
             r"    \centering",
+            "",
             rf"    \incfig{{{name}}}",
-            rf"    \caption{{{title}}}",
+            "",
+            rf"    \caption{{{caption}}}",
             rf"    \label{{fig:{label}}}",
             r"\end{figure}",
         )
     )
 
 
-def import_file(name, path):
+def importFile(name, path):
     import importlib.util as util
 
     spec = util.spec_from_file_location(name, path)
+
+    if not spec:
+        return
+    if not spec.loader:
+        return
+
     module = util.module_from_spec(spec)
+
     spec.loader.exec_module(module)
     return module
 
 
-user_dir = Path(user_config_dir("inkscape-figures", "Castel"))
+userDir = Path(user_config_dir("lesson-manager"))
 
-if not user_dir.is_dir():
-    user_dir.mkdir()
+if not userDir.is_dir():
+    userDir.mkdir()
 
-roots_file = user_dir / "roots"
-template = user_dir / "template.svg"
-config = user_dir / "config.py"
+rootsFile = userDir / "roots"
+configFile = userDir / "config.yaml"
+template = userDir / "template.svg"
+configFile = yaml.safe_load(configFile.read_text())
+currentCourseDir = Path(configFile["current_course"])
 
-if not roots_file.is_file():
-    roots_file.touch()
+# Create the roots file if it does not exist
+if not rootsFile.is_file():
+    rootsFile.touch()
 
+# Check if there is a template file for the current course
+if currentCourseDir.is_file():
+    template = Path(str(currentCourseDir) + "/figures/template.svg")
+
+# If the template file does not exist, copy the default template
+# to the current course directory
 if not template.is_file():
     source = str(Path(__file__).parent / "template.svg")
     destination = str(template)
     copy(source, destination)
 
-if config.exists():
-    config_module = import_file("config", config)
-    latex_template = config_module.latex_template
 
-
-def add_root(path):
+def addRoot(path):
     path = str(path)
-    roots = get_roots()
+    roots = getRoots()
     if path in roots:
         return None
 
     roots.append(path)
-    roots_file.write_text("\n".join(roots))
+    rootsFile.write_text("\n".join(roots))
 
 
-def get_roots():
-    return [root for root in roots_file.read_text().split("\n") if root != ""]
+def getRoots():
+    return [root for root in rootsFile.read_text().split("\n") if root != ""]
 
 
 @click.group()
@@ -109,9 +161,9 @@ def watch(daemon):
     Watches for figures.
     """
     if platform.system() == "Linux":
-        watcher_cmd = watch_daemon_inotify
+        watcher_cmd = watchDaemonInotify
     else:
-        watcher_cmd = watch_daemon_fswatch
+        watcher_cmd = watchDaemonFSwatch
 
     if daemon:
         daemon = Daemonize(
@@ -126,7 +178,7 @@ def watch(daemon):
         watcher_cmd()
 
 
-def maybe_recompile_figure(filepath):
+def maybeRecompileFigure(filepath):
     filepath = Path(filepath)
     if filepath.suffix != ".svg":
         log.debug(
@@ -136,34 +188,34 @@ def maybe_recompile_figure(filepath):
 
     log.info("Recompiling %s", filepath)
 
-    pdf_path = filepath.parent / (filepath.stem + ".pdf")
+    pdfPath = filepath.parent / (filepath.stem + ".pdf")
     name = filepath.stem
 
-    inkscape_version = subprocess.check_output(
+    inkscapeVersion = subprocess.check_output(
         ["inkscape", "--version"], universal_newlines=True
     )
-    log.debug(inkscape_version)
+    log.debug(inkscapeVersion)
 
-    inkscape_version = re.findall(r"[0-9.]+", inkscape_version)[0]
-    inkscape_version_number = [
+    inkscapeVersion = re.findall(r"[0-9.]+", inkscapeVersion)[0]
+    inkscapeVersionNumber = [
         int(part)
-        for part in inkscape_version.split(
+        for part in inkscapeVersion.split(
             ".",
         )
     ]
 
-    inkscape_version_number = inkscape_version_number + [0] * (
-        3 - len(inkscape_version_number)
+    inkscapeVersionNumber = inkscapeVersionNumber + [0] * (
+        3 - len(inkscapeVersionNumber)
     )
 
-    if inkscape_version_number < [1, 0, 0]:
+    if inkscapeVersionNumber < [1, 0, 0]:
         command = [
             "inkscape",
             "--export-area-page",
             "--export-dpi",
             "300",
             "--export-pdf",
-            pdf_path,
+            pdfPath,
             "--export-latex",
             filepath,
         ]
@@ -177,36 +229,36 @@ def maybe_recompile_figure(filepath):
             "--export-type=pdf",
             "--export-latex",
             "--export-filename",
-            pdf_path,
+            pdfPath,
         ]
 
     log.debug("Running command:")
-    log.debug(textwrap.indent(" ".join(str(e) for e in command), "    "))
+    log.debug(textwrap.indent(" ".join(str(e) for e in command), "  "))
 
-    completed_process = subprocess.run(command)
+    completedProcess = subprocess.run(command)
 
-    if completed_process.returncode != 0:
-        log.error("Return code %s", completed_process.returncode)
+    if completedProcess.returncode != 0:
+        log.error("Return code %s", completedProcess.returncode)
     else:
         log.debug("Command succeeded")
 
-    template = latex_template(name, beautify(name))
+    template = latexTemplate(name, beautify(name))
     pyperclip.copy(template)
     log.debug("Copying LaTeX template:")
     log.debug(textwrap.indent(template, "    "))
 
 
-def watch_daemon_inotify():
+def watchDaemonInotify():
     import inotify.adapters
     from inotify.constants import IN_CLOSE_WRITE
 
     while True:
-        roots = get_roots()
+        roots = getRoots()
 
         i = inotify.adapters.Inotify()
-        i.add_watch(str(roots_file), mask=IN_CLOSE_WRITE)
+        i.add_watch(str(rootsFile), mask=IN_CLOSE_WRITE)
 
-        log.info("Watching directories: " + ", ".join(get_roots()))
+        log.info("Watching directories: " + ", ".join(getRoots()))
         for root in roots:
             try:
                 i.add_watch(root, mask=IN_CLOSE_WRITE)
@@ -214,9 +266,12 @@ def watch_daemon_inotify():
                 log.debug("Could not add root %s", root)
 
         for event in i.event_gen(yield_nones=False):
-            (_, type_names, path, filename) = event
+            if event is None:
+                return
 
-            if path == str(roots_file):
+            (_, _, path, filename) = event
+
+            if path == str(rootsFile):
                 log.info("The roots file has been updated. Updating watches.")
                 for root in roots:
                     try:
@@ -228,30 +283,33 @@ def watch_daemon_inotify():
 
             # A file has changed
             path = Path(path) / filename
-            maybe_recompile_figure(path)
+            maybeRecompileFigure(path)
 
 
-def watch_daemon_fswatch():
+def watchDaemonFSwatch():
     while True:
-        roots = get_roots()
+        roots = getRoots()
         log.info("Watching directories: " + ", ".join(roots))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ResourceWarning)
             p = subprocess.Popen(
-                ["fswatch", *roots, str(user_dir)],
+                ["fswatch", *roots, str(userDir)],
                 stdout=subprocess.PIPE,
                 universal_newlines=True,
             )
 
         while True:
+            if not p.stdout:
+                return
+
             filepath = p.stdout.readline().strip()
 
-            if filepath == str(roots_file):
+            if filepath == str(rootsFile):
                 log.info("The roots file has been updated. Updating watches.")
                 p.terminate()
                 log.debug("Removed main watch %s")
                 break
-            maybe_recompile_figure(filepath)
+            maybeRecompileFigure(filepath)
 
 
 @cli.command()
@@ -263,23 +321,28 @@ def watch_daemon_fswatch():
 )
 def create(title, root):
     title = title.strip()
-    file_name = title.replace(" ", "-").lower() + ".svg"
+    fileName = title.replace(" ", "-").lower() + ".svg"
     figures = Path(root).absolute()
     if not figures.exists():
         figures.mkdir()
 
-    figure_path = figures / file_name
+    figurePath = figures / fileName
 
-    if figure_path.exists():
+    if figurePath.exists():
         print(title + " 2")
         return
 
-    copy(str(template), str(figure_path))
-    add_root(figures)
-    inkscape(figure_path)
+    copy(str(template), str(figurePath))
+    addRoot(figures)
+    inkscape(figurePath)
 
-    leading_spaces = len(title) - len(title.lstrip())
-    print(indent(latex_template(figure_path.stem, title), indentation=leading_spaces))
+    leadingSpaces = len(title) - len(title.lstrip())
+    print(
+        indent(
+            latexTemplate(figurePath.stem, title),
+            indentation=leadingSpaces,
+        )
+    )
 
 
 @cli.command()
@@ -295,13 +358,13 @@ def edit(root):
     files = sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
 
     names = [beautify(f.stem) for f in files]
-    _, index, selected = pick(names)
+    _, index, selected = select("Select figure", names)
     if selected:
         path = files[index]
-        add_root(figures)
+        addRoot(figures)
         inkscape(path)
 
-        template = latex_template(path.stem, beautify(path.stem))
+        template = latexTemplate(path.stem, beautify(path.stem))
         pyperclip.copy(template)
         log.debug("Copying LaTeX template:")
         log.debug(textwrap.indent(template, "    "))
